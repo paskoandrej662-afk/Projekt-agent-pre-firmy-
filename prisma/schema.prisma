@@ -1,0 +1,202 @@
+// BarberAI — Prisma schema
+// Multi-tenant SaaS: every domain record is scoped to a Barber via `barberId`.
+// Future-stage fields (AI, Instagram/Unipile, Google Calendar) are modelled now
+// but remain unused until later steps.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Pooled connection (PgBouncer) — used by the app at runtime for horizontal scale.
+  url      = env("DATABASE_URL")
+  // Direct connection — used by Prisma Migrate / introspection only.
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Who currently drives a conversation. Used later for AI ↔ human handoff.
+enum ConversationControl {
+  AI
+  BARBER
+}
+
+/// Author of a message.
+enum MessageSender {
+  CUSTOMER
+  AI
+  BARBER
+}
+
+/// Lifecycle of a booking.
+enum BookingStatus {
+  CONFIRMED
+  CANCELLED
+}
+
+/// Why a notification was raised for the barber.
+enum NotificationType {
+  AI_UNSURE // AI was not confident enough to answer
+  PRICE_GUARD // reply mentioned a price not matching any service
+  AI_ERROR // AI/Unipile call failed — customer waiting
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tenant root
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A barber/business — the tenant. All other records hang off this.
+model Barber {
+  id           String @id @default(cuid())
+  businessName String
+  phone        String
+  email        String @unique
+  address      String
+
+  /// Opening hours per day, e.g.
+  /// { "mon": { "open": true, "from": "09:00", "to": "17:00" }, "tue": {...}, ... }
+  workingHours Json @default("{}")
+
+  /// Buffer/break between appointments, in minutes.
+  bufferMin Int @default(0)
+
+  // ── Future-stage fields (unused in this step) ──────────────────────────────
+  /// Learned WRITING STYLE ONLY (tone/emoji). Never prices or facts.
+  aiStyle String?
+  /// Structured style toggles set later via chat, e.g. { "formal": false, "emojiLevel": "low" }.
+  aiTonePrefs Json?
+  /// Google Calendar OAuth tokens (set during a later step).
+  googleCalendarTokens Json?
+  /// Unipile Instagram account id (set during a later step).
+  instagramAccountId String?
+
+  // ── Onboarding progress (lets the wizard resume after a refresh/crash) ──────
+  onboardingStep     Int     @default(1)
+  onboardingComplete Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  services      Service[]
+  conversations Conversation[]
+  bookings      Booking[]
+  notifications Notification[]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Catalogue
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A service offered by a barber (haircut, beard, etc.).
+model Service {
+  id          String  @id @default(cuid())
+  barberId    String
+  name        String
+  durationMin Int
+  priceEur    Decimal @db.Decimal(10, 2)
+  active      Boolean @default(true)
+
+  barber   Barber    @relation(fields: [barberId], references: [id], onDelete: Cascade)
+  bookings Booking[]
+
+  @@index([barberId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messaging (future stages)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A single chat thread with one customer on one channel.
+model Conversation {
+  id             String              @id @default(cuid())
+  barberId       String
+  customerHandle String
+  /// Display name of the customer (e.g. Instagram profile name), when known.
+  customerName String?
+  channel      String // e.g. "instagram"
+  /// Unipile internal chat id from the webhook — preferred way to send replies.
+  externalChatId String?
+  /// Attendee provider id (Instagram user id) — used to start/send a chat when
+  /// the chat isn't synced yet (brand-new DM).
+  attendeeProviderId String?
+  controlledBy     ConversationControl @default(AI)
+  lastHumanReplyAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  barber        Barber         @relation(fields: [barberId], references: [id], onDelete: Cascade)
+  messages      Message[]
+  notifications Notification[]
+
+  // One thread per customer per channel for a given barber.
+  @@unique([barberId, customerHandle, channel])
+  @@index([barberId])
+}
+
+/// A single message within a conversation.
+model Message {
+  id             String        @id @default(cuid())
+  conversationId String
+  sender         MessageSender
+  text           String
+  /// De-dupes incoming webhook messages (prevents double processing later).
+  externalId String? @unique
+  createdAt  DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bookings (future stages)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A confirmed/cancelled appointment.
+model Booking {
+  id             String  @id @default(cuid())
+  barberId       String
+  conversationId String?
+  customerName   String
+  serviceId      String
+  startTime      DateTime
+  endTime        DateTime
+  googleEventId  String?
+  status         BookingStatus @default(CONFIRMED)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  barber  Barber  @relation(fields: [barberId], references: [id], onDelete: Cascade)
+  service Service @relation(fields: [serviceId], references: [id])
+
+  @@index([barberId])
+  @@index([startTime])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Notifications — raised when the AI stays silent and needs the barber
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Something needs the barber's attention (AI unsure, price guard, or an error).
+model Notification {
+  id             String           @id @default(cuid())
+  barberId       String
+  conversationId String?
+  type           NotificationType
+  message        String
+  /// The reply the AI drafted but did not send — barber can review/copy/send.
+  draftReply String?
+  read       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  barber       Barber        @relation(fields: [barberId], references: [id], onDelete: Cascade)
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+
+  @@index([barberId])
+}
