@@ -1,12 +1,9 @@
 import type { NotificationType } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { sendReply, UnipileError, type SendStrategy } from "@/lib/unipile";
-import {
-  generateDraft,
-  priceGuard,
-  HOLDING_LINE_ENABLED,
-  HOLDING_LINE_TEXT,
-} from "@/lib/ai/reply";
+import { priceGuard, HOLDING_LINE_ENABLED, HOLDING_LINE_TEXT } from "@/lib/ai/reply";
+import { runAssistant } from "@/lib/ai/agent";
+import type { BookingContext } from "@/lib/booking/actions";
 
 const HISTORY_LIMIT = 15;
 
@@ -99,10 +96,32 @@ export async function processIncomingMessage(conversationId: string): Promise<vo
       text,
     );
 
-  // 1) Generate the draft.
+  // Booking context (Step 3): the AI may read availability + book/reschedule/cancel
+  // through live calendar tools. Connected iff the barber stored Google tokens.
+  const calendarConnected = barber.googleCalendarTokens != null;
+  const ctx: BookingContext = {
+    barber: {
+      id: barber.id,
+      bufferMin: barber.bufferMin,
+      workingHours: barber.workingHours,
+      googleCalendarTokens: barber.googleCalendarTokens,
+    },
+    services: services.map((s) => ({ id: s.id, name: s.name, durationMin: s.durationMin })),
+    conversation: {
+      id: conversation.id,
+      customerHandle: conversation.customerHandle,
+      customerName: conversation.customerName,
+    },
+    now: new Date(),
+  };
+
+  // 1) Generate the draft (tool-use loop when the calendar is connected).
   let draft;
+  let writeOccurred = false;
   try {
-    draft = await generateDraft(barber, services, history);
+    const result = await runAssistant({ barberFacts: barber, services, history, ctx, calendarConnected });
+    draft = result.draft;
+    writeOccurred = result.writeOccurred;
   } catch (err) {
     console.warn(`[messaging] AI generovanie zlyhalo (@${handle}): ${describeError(err)}`);
     await notify(
@@ -115,7 +134,33 @@ export async function processIncomingMessage(conversationId: string): Promise<vo
     return;
   }
 
-  // 2) Confidence gate + defensive price guard.
+  // 2a) A booking write (book/reschedule/cancel) already happened → the customer
+  // MUST get the confirmation, regardless of the model's self-reported confidence.
+  if (writeOccurred) {
+    const text = draft.reply.trim() || "Hotovo, termín je zapísaný ✅";
+    const sent = await send(text);
+    if (sent.ok) {
+      if (sent.strategy !== "none") {
+        console.log(`[messaging] potvrdenie rezervácie odoslané (@${handle}) stratégiou=${sent.strategy}`);
+      }
+      await prisma.message
+        .create({ data: { conversationId: conversation.id, sender: "AI", text, externalId: sent.messageId } })
+        .catch((e) => console.warn(`[messaging] AI správa neuložená: ${e?.code ?? e}`));
+    } else {
+      // Booking is done but we couldn't deliver the confirmation → hand it to the barber.
+      console.warn(`[messaging] potvrdenie rezervácie neodoslané (@${handle}): ${sent.error}`);
+      await notify(
+        barber.id,
+        conversation.id,
+        "AI_ERROR",
+        `Rezervácia pre @${handle} je zapísaná, ale potvrdenie sa nepodarilo odoslať. Pošlite ho, prosím, ručne.`,
+        text,
+      );
+    }
+    return;
+  }
+
+  // 2b) No write happened → Step 2 confidence gate + defensive price guard.
   const priceIssue = priceGuard(draft.reply, allowedPrices);
   const confident = draft.confident && !priceIssue && draft.reply.trim().length > 0;
   const needsBarber = draft.needs_barber || priceIssue || !confident;

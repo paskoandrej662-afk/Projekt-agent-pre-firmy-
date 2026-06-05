@@ -5,7 +5,9 @@ import { loadCurrentBarber } from "@/lib/barber";
 import { prisma } from "@/lib/prisma";
 import { DAY_KEYS, DAY_LABELS, normalizeWorkingHours } from "@/lib/days";
 import { formatDateTime, formatDuration, formatEur } from "@/lib/format";
+import { formatBratislava } from "@/lib/booking/timezone";
 import { ConnectInstagramButton } from "@/components/dashboard/ConnectInstagramButton";
+import { ConnectGoogleCalendarButton } from "@/components/dashboard/ConnectGoogleCalendarButton";
 import { LearnStyleButton } from "@/components/dashboard/LearnStyleButton";
 import { NotificationCard } from "@/components/dashboard/NotificationCard";
 
@@ -70,12 +72,12 @@ function Section({
 export default async function DashboardPage({
   searchParams,
 }: {
-  searchParams: { ig?: string };
+  searchParams: { ig?: string; cal?: string };
 }) {
   const barber = await loadCurrentBarber();
   if (!barber || !barber.onboardingComplete) redirect("/onboarding");
 
-  const [notifications, conversations] = await Promise.all([
+  const [notifications, conversations, bookings] = await Promise.all([
     prisma.notification.findMany({
       where: { barberId: barber.id, read: false },
       orderBy: { createdAt: "desc" },
@@ -87,6 +89,12 @@ export default async function DashboardPage({
       orderBy: { updatedAt: "desc" },
       take: 10,
       include: { messages: { orderBy: { createdAt: "desc" }, take: 1 } },
+    }),
+    prisma.booking.findMany({
+      where: { barberId: barber.id, status: "CONFIRMED", startTime: { gte: new Date() } },
+      orderBy: { startTime: "asc" },
+      take: 10,
+      include: { service: true },
     }),
   ]);
 
@@ -116,6 +124,21 @@ export default async function DashboardPage({
       {searchParams.ig === "failure" && (
         <div className="mb-5 rounded-lg bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-100">
           Pripojenie Instagramu sa nepodarilo. Skúste to znova.
+        </div>
+      )}
+      {searchParams.cal === "success" && (
+        <div className="mb-5 rounded-lg bg-green-50 p-3 text-sm text-green-700 ring-1 ring-green-100">
+          Google Kalendár bol úspešne pripojený. 📅
+        </div>
+      )}
+      {searchParams.cal === "failure" && (
+        <div className="mb-5 rounded-lg bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-100">
+          Pripojenie Google Kalendára sa nepodarilo. Skúste to znova.
+        </div>
+      )}
+      {searchParams.cal === "config" && (
+        <div className="mb-5 rounded-lg bg-amber-50 p-3 text-sm text-amber-800 ring-1 ring-amber-100">
+          Google Kalendár zatiaľ nie je nakonfigurovaný na serveri (chýbajú GOOGLE_* premenné).
         </div>
       )}
 
@@ -195,6 +218,44 @@ export default async function DashboardPage({
               </p>
               <ConnectInstagramButton />
             </>
+          )}
+        </Section>
+
+        {/* Google Calendar connection */}
+        <Section title="Google Kalendár">
+          {calendarConnected ? (
+            <p className="text-sm text-slate-600">
+              Kalendár je pripojený — AI overuje voľné termíny a rezervuje priamo do vášho kalendára.
+              Súkromné udalosti zostávajú skryté: AI vidí len že je daný čas obsadený, nie čo v ňom máte.
+            </p>
+          ) : (
+            <>
+              <p className="mb-4 text-sm text-slate-500">
+                Pripojte svoj Google Kalendár, aby AI mohla overovať voľné termíny a rezervovať za vás.
+              </p>
+              <ConnectGoogleCalendarButton />
+            </>
+          )}
+        </Section>
+
+        {/* Upcoming bookings */}
+        <Section title="Najbližšie rezervácie">
+          {bookings.length === 0 ? (
+            <p className="text-sm text-slate-400">Zatiaľ žiadne rezervácie.</p>
+          ) : (
+            <ul className="divide-y divide-slate-100">
+              {bookings.map((b) => (
+                <li key={b.id} className="flex items-center justify-between gap-2 py-2.5">
+                  <div>
+                    <p className="font-medium text-slate-800">{b.service.name}</p>
+                    <p className="text-xs text-slate-500">{b.customerName}</p>
+                  </div>
+                  <span className="shrink-0 text-sm font-medium text-slate-700">
+                    {formatBratislava(b.startTime)}
+                  </span>
+                </li>
+              ))}
+            </ul>
           )}
         </Section>
 

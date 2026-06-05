@@ -8,7 +8,7 @@ export const HOLDING_LINE_ENABLED = (process.env.AI_HOLDING_LINE ?? "on").toLowe
 export const HOLDING_LINE_TEXT = "Mrknem na to a ozvem sa ti čo najskôr 👍";
 
 // Forced-tool-use gives us a reliable JSON wrapper (no fragile parsing).
-const DRAFT_TOOL: Anthropic.Tool = {
+export const DRAFT_TOOL: Anthropic.Tool = {
   name: "draft_reply",
   description: "Navrhni odpoveď zákazníkovi a urči, či je AI dostatočne istá.",
   input_schema: {
@@ -38,13 +38,23 @@ export type DraftReply = {
 
 export type HistoryMessage = { sender: "CUSTOMER" | "AI" | "BARBER"; text: string };
 
-function toMessages(history: HistoryMessage[]): Anthropic.MessageParam[] {
+export function toMessages(history: HistoryMessage[]): Anthropic.MessageParam[] {
   const msgs: Anthropic.MessageParam[] = history
     .filter((m) => m.text && m.text.trim().length > 0)
     .map((m) => ({ role: m.sender === "CUSTOMER" ? "user" : "assistant", content: m.text }));
   // The API requires the first message to come from the user.
   while (msgs.length && msgs[0].role !== "user") msgs.shift();
   return msgs;
+}
+
+/** Normalise a (possibly partial) draft_reply tool input into a safe DraftReply. */
+export function coerceDraft(input: Partial<DraftReply>): DraftReply {
+  return {
+    reply: typeof input.reply === "string" ? input.reply : "",
+    confident: input.confident === true,
+    needs_barber: input.needs_barber === true,
+    reason: typeof input.reason === "string" ? input.reason : "",
+  };
 }
 
 /** Generate the structured draft via Claude (forced tool use + prompt caching). */
@@ -70,13 +80,7 @@ export async function generateDraft(
   const block = res.content.find((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
   if (!block) throw new Error("AI nevrátila štruktúrovanú odpoveď.");
 
-  const input = block.input as Partial<DraftReply>;
-  return {
-    reply: typeof input.reply === "string" ? input.reply : "",
-    confident: input.confident === true,
-    needs_barber: input.needs_barber === true,
-    reason: typeof input.reason === "string" ? input.reason : "",
-  };
+  return coerceDraft(block.input as Partial<DraftReply>);
 }
 
 /**
